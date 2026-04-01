@@ -23,9 +23,10 @@ use runtime::{
     clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
     parse_oauth_callback_request_target, save_oauth_credentials, ApiClient, ApiRequest,
     AssistantEvent, CompactionConfig, ConfigLoader, ConfigSource, ContentBlock,
-    ConversationMessage, ConversationRuntime, MessageRole, OAuthAuthorizationRequest,
-    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    ConversationMessage, ConversationRuntime, McpServerManager, MessageRole,
+    OAuthAuthorizationRequest, OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy,
+    ProjectContext, ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
 use serde_json::json;
 use tools::{execute_tool, mvp_tool_specs};
@@ -53,7 +54,9 @@ Run `rusty-claude-cli --help` for usage."
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    match parse_args(&args)? {
+    let runtime_config = load_runtime_config()?;
+    let defaults = RuntimeDefaults::from_config(&runtime_config);
+    match parse_args(&args, &defaults)? {
         CliAction::DumpManifests => dump_manifests(),
         CliAction::BootstrapPlan => print_bootstrap_plan(),
         CliAction::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
@@ -78,6 +81,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Help => print_help(),
     }
     Ok(())
+}
+
+fn load_runtime_config() -> Result<runtime::RuntimeConfig, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    Ok(ConfigLoader::default_for(&cwd).load()?)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,8 +135,8 @@ impl CliOutputFormat {
     }
 }
 
-fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+fn parse_args(args: &[String], defaults: &RuntimeDefaults) -> Result<CliAction, String> {
+    let mut model = defaults.model.clone();
     let mut output_format = CliOutputFormat::Text;
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
@@ -229,6 +237,32 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             allowed_tools,
         }),
         other => Err(format!("unknown subcommand: {other}")),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeDefaults {
+    model: String,
+}
+
+impl RuntimeDefaults {
+    fn from_config(config: &runtime::RuntimeConfig) -> Self {
+        Self {
+            model: config.model().unwrap_or(DEFAULT_MODEL).to_string(),
+        }
+    }
+}
+
+fn resolved_permission_mode_label(config: &runtime::RuntimeConfig) -> &'static str {
+    match env::var("RUSTY_CLAUDE_PERMISSION_MODE") {
+        Ok(value) if value == "read-only" => "read-only",
+        Ok(value) if value == "danger-full-access" => "danger-full-access",
+        Ok(value) if value == "workspace-write" => "workspace-write",
+        _ => match config.permission_mode() {
+            Some(ResolvedPermissionMode::ReadOnly) => "read-only",
+            Some(ResolvedPermissionMode::DangerFullAccess) => "danger-full-access",
+            Some(ResolvedPermissionMode::WorkspaceWrite) | None => "workspace-write",
+        },
     }
 }
 
@@ -892,14 +926,18 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = load_runtime_config()?;
         let system_prompt = build_system_prompt()?;
         let session = create_managed_session_handle()?;
+        let permission_mode = resolved_permission_mode_label(&config);
         let runtime = build_runtime(
             Session::new(),
             model.clone(),
             system_prompt.clone(),
             enable_tools,
             allowed_tools.clone(),
+            &config,
+            permission_mode,
         )?;
         let cli = Self {
             model,
@@ -1089,12 +1127,15 @@ impl LiveCli {
         let previous = self.model.clone();
         let session = self.runtime.session().clone();
         let message_count = session.messages.len();
+        let config = load_runtime_config()?;
         self.runtime = build_runtime(
             session,
             model.clone(),
             self.system_prompt.clone(),
             true,
             self.allowed_tools.clone(),
+            &config,
+            resolved_permission_mode_label(&config),
         )?;
         self.model.clone_from(&model);
         self.persist_session()?;
@@ -1124,12 +1165,14 @@ impl LiveCli {
 
         let previous = permission_mode_label().to_string();
         let session = self.runtime.session().clone();
+        let config = load_runtime_config()?;
         self.runtime = build_runtime_with_permission_mode(
             session,
             self.model.clone(),
             self.system_prompt.clone(),
             true,
             self.allowed_tools.clone(),
+            &config,
             normalized,
         )?;
         self.persist_session()?;
@@ -1149,12 +1192,14 @@ impl LiveCli {
         }
 
         self.session = create_managed_session_handle()?;
+        let config = load_runtime_config()?;
         self.runtime = build_runtime_with_permission_mode(
             Session::new(),
             self.model.clone(),
             self.system_prompt.clone(),
             true,
             self.allowed_tools.clone(),
+            &config,
             permission_mode_label(),
         )?;
         self.persist_session()?;
@@ -1184,12 +1229,14 @@ impl LiveCli {
         let handle = resolve_session_reference(&session_ref)?;
         let session = Session::load_from_path(&handle.path)?;
         let message_count = session.messages.len();
+        let config = load_runtime_config()?;
         self.runtime = build_runtime_with_permission_mode(
             session,
             self.model.clone(),
             self.system_prompt.clone(),
             true,
             self.allowed_tools.clone(),
+            &config,
             permission_mode_label(),
         )?;
         self.session = handle;
@@ -1261,12 +1308,14 @@ impl LiveCli {
                 let handle = resolve_session_reference(target)?;
                 let session = Session::load_from_path(&handle.path)?;
                 let message_count = session.messages.len();
+                let config = load_runtime_config()?;
                 self.runtime = build_runtime_with_permission_mode(
                     session,
                     self.model.clone(),
                     self.system_prompt.clone(),
                     true,
                     self.allowed_tools.clone(),
+                    &config,
                     permission_mode_label(),
                 )?;
                 self.session = handle;
@@ -1291,12 +1340,14 @@ impl LiveCli {
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
         let skipped = removed == 0;
+        let config = load_runtime_config()?;
         self.runtime = build_runtime_with_permission_mode(
             result.compacted_session,
             self.model.clone(),
             self.system_prompt.clone(),
             true,
             self.allowed_tools.clone(),
+            &config,
             permission_mode_label(),
         )?;
         self.persist_session()?;
@@ -1687,11 +1738,11 @@ fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
 }
 
 fn permission_mode_label() -> &'static str {
-    match env::var("RUSTY_CLAUDE_PERMISSION_MODE") {
-        Ok(value) if value == "read-only" => "read-only",
-        Ok(value) if value == "danger-full-access" => "danger-full-access",
-        _ => "workspace-write",
-    }
+    let cwd = env::current_dir().ok();
+    let config = cwd.and_then(|cwd| ConfigLoader::default_for(cwd).load().ok());
+    config
+        .as_ref()
+        .map_or("workspace-write", resolved_permission_mode_label)
 }
 
 fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
@@ -1823,6 +1874,8 @@ fn build_runtime(
     system_prompt: Vec<String>,
     enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
+    config: &runtime::RuntimeConfig,
+    permission_mode: &str,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     build_runtime_with_permission_mode(
@@ -1831,7 +1884,8 @@ fn build_runtime(
         system_prompt,
         enable_tools,
         allowed_tools,
-        permission_mode_label(),
+        config,
+        permission_mode,
     )
 }
 
@@ -1841,13 +1895,14 @@ fn build_runtime_with_permission_mode(
     system_prompt: Vec<String>,
     enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
+    config: &runtime::RuntimeConfig,
     permission_mode: &str,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     Ok(ConversationRuntime::new(
         session,
-        AnthropicRuntimeClient::new(model, enable_tools, allowed_tools.clone())?,
-        CliToolExecutor::new(allowed_tools),
+        AnthropicRuntimeClient::new(model, enable_tools, allowed_tools.clone(), config)?,
+        CliToolExecutor::new(allowed_tools, config),
         permission_policy(permission_mode),
         system_prompt,
     ))
@@ -1859,6 +1914,7 @@ struct AnthropicRuntimeClient {
     model: String,
     enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
+    mcp_tool_definitions: Vec<ToolDefinition>,
 }
 
 impl AnthropicRuntimeClient {
@@ -1866,15 +1922,47 @@ impl AnthropicRuntimeClient {
         model: String,
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
+        config: &runtime::RuntimeConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mcp_tool_definitions = discover_mcp_tool_definitions(config, allowed_tools.as_ref())?;
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client: AnthropicClient::from_auth(resolve_cli_auth_source()?),
             model,
             enable_tools,
             allowed_tools,
+            mcp_tool_definitions,
         })
     }
+}
+
+fn discover_mcp_tool_definitions(
+    config: &runtime::RuntimeConfig,
+    allowed_tools: Option<&AllowedToolSet>,
+) -> Result<Vec<ToolDefinition>, Box<dyn std::error::Error>> {
+    if allowed_tools.is_some() || config.mcp().servers().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let tools = runtime.block_on(async {
+        let mut manager = McpServerManager::from_runtime_config(config);
+        let tools = manager.discover_tools().await?;
+        manager.shutdown().await?;
+        Ok::<_, runtime::McpServerManagerError>(tools)
+    })?;
+
+    Ok(tools
+        .into_iter()
+        .map(|tool| ToolDefinition {
+            name: tool.qualified_name,
+            description: tool.tool.description,
+            input_schema: tool
+                .tool
+                .input_schema
+                .unwrap_or_else(|| serde_json::json!({"type":"object"})),
+        })
+        .collect())
 }
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
@@ -1910,6 +1998,7 @@ impl ApiClient for AnthropicRuntimeClient {
                         description: Some(spec.description.to_string()),
                         input_schema: spec.input_schema,
                     })
+                    .chain(self.mcp_tool_definitions.iter().cloned())
                     .collect()
             }),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
@@ -2059,13 +2148,22 @@ fn response_to_events(
 struct CliToolExecutor {
     renderer: TerminalRenderer,
     allowed_tools: Option<AllowedToolSet>,
+    mcp_runtime: Option<tokio::runtime::Runtime>,
+    mcp_servers: Option<McpServerManager>,
 }
 
 impl CliToolExecutor {
-    fn new(allowed_tools: Option<AllowedToolSet>) -> Self {
+    fn new(allowed_tools: Option<AllowedToolSet>, config: &runtime::RuntimeConfig) -> Self {
+        let mcp_servers = (!config.mcp().servers().is_empty())
+            .then(|| McpServerManager::from_runtime_config(config));
+        let mcp_runtime = mcp_servers
+            .as_ref()
+            .map(|_| tokio::runtime::Runtime::new().expect("mcp runtime"));
         Self {
             renderer: TerminalRenderer::new(),
             allowed_tools,
+            mcp_runtime,
+            mcp_servers,
         }
     }
 }
@@ -2081,8 +2179,35 @@ impl ToolExecutor for CliToolExecutor {
                 "tool `{tool_name}` is not enabled by the current --allowedTools setting"
             )));
         }
-        let value = serde_json::from_str(input)
+        let value: serde_json::Value = serde_json::from_str(input)
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
+        if tool_name.starts_with("mcp__") {
+            let runtime = self
+                .mcp_runtime
+                .as_mut()
+                .ok_or_else(|| ToolError::new("MCP runtime is not configured"))?;
+            let manager = self
+                .mcp_servers
+                .as_mut()
+                .ok_or_else(|| ToolError::new("MCP servers are not configured"))?;
+            let response = runtime
+                .block_on(manager.call_tool(tool_name, Some(value.clone())))
+                .map_err(|error| ToolError::new(error.to_string()))?;
+            let output = serde_json::to_string_pretty(&response)
+                .map_err(|error| ToolError::new(error.to_string()))?;
+            let markdown = format!(
+                "### Tool `{tool_name}`
+
+```json
+{output}
+```
+"
+            );
+            self.renderer
+                .stream_markdown(&markdown, &mut io::stdout())
+                .map_err(|error| ToolError::new(error.to_string()))?;
+            return Ok(output);
+        }
         match execute_tool(tool_name, &value) {
             Ok(output) => {
                 let markdown = format!("### Tool `{tool_name}`\n\n```json\n{output}\n```\n");
@@ -2195,23 +2320,154 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_tool_specs, format_compact_report, format_cost_report, format_init_report,
-        format_model_report, format_model_switch_report, format_permissions_report,
-        format_permissions_switch_report, format_resume_report, format_status_report,
-        normalize_permission_mode, parse_args, parse_git_status_metadata, render_config_report,
-        render_init_claude_md, render_memory_report, render_repl_help,
-        resume_supported_slash_commands, status_context, CliAction, CliOutputFormat, SlashCommand,
-        StatusUsage, DEFAULT_MODEL,
+        discover_mcp_tool_definitions, filter_tool_specs, format_compact_report,
+        format_cost_report, format_init_report, format_model_report, format_model_switch_report,
+        format_permissions_report, format_permissions_switch_report, format_resume_report,
+        format_status_report, normalize_permission_mode, parse_args, parse_git_status_metadata,
+        render_config_report, render_init_claude_md, render_memory_report, render_repl_help,
+        resolved_permission_mode_label, resume_supported_slash_commands, status_context, CliAction,
+        CliOutputFormat, RuntimeDefaults, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
-    use runtime::{ContentBlock, ConversationMessage, MessageRole};
+    use runtime::{
+        ConfigLoader, ContentBlock, ConversationMessage, MessageRole, ResolvedPermissionMode,
+    };
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("rusty-claude-cli-tests-{nanos}"))
+    }
+
+    fn write_mcp_server_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let path = root.join("mcp-server.py");
+        fs::write(
+            &path,
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+def send(obj):
+    payload = json.dumps(obj)
+    sys.stdout.write(f"Content-Length: {len(payload)}\r\n\r\n{payload}")
+    sys.stdout.flush()
+
+def read_request():
+    headers = {}
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        key, _, value = line.decode().partition(":")
+        headers[key.strip().lower()] = value.strip()
+    length = int(headers.get("content-length", "0"))
+    if length <= 0:
+        return None
+    payload = sys.stdin.buffer.read(length)
+    return json.loads(payload.decode())
+
+while True:
+    req = read_request()
+    if req is None:
+        break
+    method = req.get("method")
+    req_id = req.get("id")
+    if method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "serverInfo": {"name": "test-server", "version": "0.1.0"}
+            }
+        })
+    elif method == "tools/list":
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "tools": [{
+                    "name": "echo",
+                    "description": "Echo from MCP",
+                    "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}}
+                }]
+            }
+        })
+    elif method == "tools/call":
+        send({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": [{"type": "text", "text": req.get("params", {}).get("name", "")}]
+            }
+        })
+"#,
+        )
+        .expect("write mcp server");
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("chmod");
+        path
+    }
 
     #[test]
     fn defaults_to_repl_when_no_args() {
         assert_eq!(
-            parse_args(&[]).expect("args should parse"),
+            parse_args(
+                &[],
+                &RuntimeDefaults {
+                    model: DEFAULT_MODEL.to_string()
+                }
+            )
+            .expect("args should parse"),
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
+                allowed_tools: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_args_uses_config_default_model_when_no_override_is_supplied() {
+        let parsed = parse_args(
+            &[],
+            &RuntimeDefaults {
+                model: "claude-opus-config".to_string(),
+            },
+        )
+        .expect("args should parse");
+        assert_eq!(
+            parsed,
+            CliAction::Repl {
+                model: "claude-opus-config".to_string(),
+                allowed_tools: None,
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_model_flag_beats_config_default_model() {
+        let parsed = parse_args(
+            &["--model".to_string(), "cli-model".to_string()],
+            &RuntimeDefaults {
+                model: "config-model".to_string(),
+            },
+        )
+        .expect("args should parse");
+        assert_eq!(
+            parsed,
+            CliAction::Repl {
+                model: "cli-model".to_string(),
                 allowed_tools: None,
             }
         );
@@ -2225,7 +2481,13 @@ mod tests {
             "world".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args(
+                &args,
+                &RuntimeDefaults {
+                    model: DEFAULT_MODEL.to_string()
+                }
+            )
+            .expect("args should parse"),
             CliAction::Prompt {
                 prompt: "hello world".to_string(),
                 model: DEFAULT_MODEL.to_string(),
@@ -2245,7 +2507,13 @@ mod tests {
             "this".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args(
+                &args,
+                &RuntimeDefaults {
+                    model: DEFAULT_MODEL.to_string()
+                }
+            )
+            .expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
                 model: "claude-opus".to_string(),
@@ -2258,11 +2526,23 @@ mod tests {
     #[test]
     fn parses_version_flags_without_initializing_prompt_mode() {
         assert_eq!(
-            parse_args(&["--version".to_string()]).expect("args should parse"),
+            parse_args(
+                &["--version".to_string()],
+                &RuntimeDefaults {
+                    model: DEFAULT_MODEL.to_string()
+                }
+            )
+            .expect("args should parse"),
             CliAction::Version
         );
         assert_eq!(
-            parse_args(&["-V".to_string()]).expect("args should parse"),
+            parse_args(
+                &["-V".to_string()],
+                &RuntimeDefaults {
+                    model: DEFAULT_MODEL.to_string()
+                }
+            )
+            .expect("args should parse"),
             CliAction::Version
         );
     }
@@ -2275,7 +2555,13 @@ mod tests {
             "--allowed-tools=write_file".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args(
+                &args,
+                &RuntimeDefaults {
+                    model: DEFAULT_MODEL.to_string()
+                }
+            )
+            .expect("args should parse"),
             CliAction::Repl {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: Some(
@@ -2290,8 +2576,13 @@ mod tests {
 
     #[test]
     fn rejects_unknown_allowed_tools() {
-        let error = parse_args(&["--allowedTools".to_string(), "teleport".to_string()])
-            .expect_err("tool should be rejected");
+        let error = parse_args(
+            &["--allowedTools".to_string(), "teleport".to_string()],
+            &RuntimeDefaults {
+                model: DEFAULT_MODEL.to_string(),
+            },
+        )
+        .expect_err("tool should be rejected");
         assert!(error.contains("unsupported tool in --allowedTools: teleport"));
     }
 
@@ -2305,7 +2596,13 @@ mod tests {
             "2026-04-01".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args(
+                &args,
+                &RuntimeDefaults {
+                    model: DEFAULT_MODEL.to_string()
+                }
+            )
+            .expect("args should parse"),
             CliAction::PrintSystemPrompt {
                 cwd: PathBuf::from("/tmp/project"),
                 date: "2026-04-01".to_string(),
@@ -2316,11 +2613,23 @@ mod tests {
     #[test]
     fn parses_login_and_logout_subcommands() {
         assert_eq!(
-            parse_args(&["login".to_string()]).expect("login should parse"),
+            parse_args(
+                &["login".to_string()],
+                &RuntimeDefaults {
+                    model: DEFAULT_MODEL.to_string(),
+                },
+            )
+            .expect("login should parse"),
             CliAction::Login
         );
         assert_eq!(
-            parse_args(&["logout".to_string()]).expect("logout should parse"),
+            parse_args(
+                &["logout".to_string()],
+                &RuntimeDefaults {
+                    model: DEFAULT_MODEL.to_string(),
+                },
+            )
+            .expect("logout should parse"),
             CliAction::Logout
         );
     }
@@ -2333,7 +2642,13 @@ mod tests {
             "/compact".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args(
+                &args,
+                &RuntimeDefaults {
+                    model: DEFAULT_MODEL.to_string()
+                }
+            )
+            .expect("args should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.json"),
                 commands: vec!["/compact".to_string()],
@@ -2351,7 +2666,13 @@ mod tests {
             "/cost".to_string(),
         ];
         assert_eq!(
-            parse_args(&args).expect("args should parse"),
+            parse_args(
+                &args,
+                &RuntimeDefaults {
+                    model: DEFAULT_MODEL.to_string()
+                }
+            )
+            .expect("args should parse"),
             CliAction::ResumeSession {
                 session_path: PathBuf::from("session.json"),
                 commands: vec![
@@ -2586,10 +2907,25 @@ mod tests {
     fn status_context_reads_real_workspace_metadata() {
         let context = status_context(None).expect("status context should load");
         assert!(context.cwd.is_absolute());
-        assert_eq!(context.discovered_config_files, 3);
+        assert_eq!(context.discovered_config_files, 5);
         assert!(context.loaded_config_files <= context.discovered_config_files);
     }
 
+    #[test]
+    fn resolved_permission_mode_prefers_env_override() {
+        let original = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "danger-full-access");
+        let config = runtime::RuntimeConfig::empty();
+        assert_eq!(
+            super::resolved_permission_mode_label(&config),
+            "danger-full-access"
+        );
+        if let Some(value) = original {
+            std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value);
+        } else {
+            std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        }
+    }
     #[test]
     fn normalizes_supported_permission_modes() {
         assert_eq!(normalize_permission_mode("read-only"), Some("read-only"));
@@ -2602,6 +2938,66 @@ mod tests {
             Some("danger-full-access")
         );
         assert_eq!(normalize_permission_mode("unknown"), None);
+    }
+
+    #[test]
+    fn resolves_permission_mode_from_config_defaults() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        fs::write(
+            cwd.join(".claude").join("settings.json"),
+            r#"{"permissions":{"defaultMode":"dontAsk"}}"#,
+        )
+        .expect("write settings");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        assert_eq!(
+            config.permission_mode(),
+            Some(ResolvedPermissionMode::DangerFullAccess)
+        );
+        assert_eq!(
+            resolved_permission_mode_label(&config),
+            "danger-full-access"
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn discovers_mcp_tool_definitions_from_config() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claude");
+        fs::create_dir_all(cwd.join(".claude")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        let script = write_mcp_server_script();
+        fs::write(
+            cwd.join(".claude").join("settings.json"),
+            format!(
+                r#"{{"mcpServers":{{"alpha":{{"command":"{}"}}}}}}"#,
+                script.display()
+            ),
+        )
+        .expect("write settings");
+
+        let config = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("config should load");
+        let tool_defs =
+            discover_mcp_tool_definitions(&config, None).expect("mcp tool definitions should load");
+
+        assert_eq!(tool_defs.len(), 1);
+        assert_eq!(tool_defs[0].name, "mcp__alpha__echo");
+        assert_eq!(tool_defs[0].description.as_deref(), Some("Echo from MCP"));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+        fs::remove_file(&script).ok();
+        fs::remove_dir_all(script.parent().expect("script parent")).ok();
     }
 
     #[test]

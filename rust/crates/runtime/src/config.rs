@@ -14,6 +14,13 @@ pub enum ConfigSource {
     Local,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedPermissionMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigEntry {
     pub source: ConfigSource,
@@ -31,6 +38,8 @@ pub struct RuntimeConfig {
 pub struct RuntimeFeatureConfig {
     mcp: McpConfigCollection,
     oauth: Option<OAuthConfig>,
+    model: Option<String>,
+    permission_mode: Option<ResolvedPermissionMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -165,10 +174,22 @@ impl ConfigLoader {
 
     #[must_use]
     pub fn discover(&self) -> Vec<ConfigEntry> {
+        let user_legacy_path = self.config_home.parent().map_or_else(
+            || PathBuf::from(".claude.json"),
+            |parent| parent.join(".claude.json"),
+        );
         vec![
             ConfigEntry {
                 source: ConfigSource::User,
+                path: user_legacy_path,
+            },
+            ConfigEntry {
+                source: ConfigSource::User,
                 path: self.config_home.join("settings.json"),
+            },
+            ConfigEntry {
+                source: ConfigSource::Project,
+                path: self.cwd.join(".claude.json"),
             },
             ConfigEntry {
                 source: ConfigSource::Project,
@@ -195,14 +216,15 @@ impl ConfigLoader {
             loaded_entries.push(entry);
         }
 
+        let merged_value = JsonValue::Object(merged.clone());
+
         let feature_config = RuntimeFeatureConfig {
             mcp: McpConfigCollection {
                 servers: mcp_servers,
             },
-            oauth: parse_optional_oauth_config(
-                &JsonValue::Object(merged.clone()),
-                "merged settings.oauth",
-            )?,
+            oauth: parse_optional_oauth_config(&merged_value, "merged settings.oauth")?,
+            model: parse_optional_model(&merged_value),
+            permission_mode: parse_optional_permission_mode(&merged_value)?,
         };
 
         Ok(RuntimeConfig {
@@ -257,6 +279,16 @@ impl RuntimeConfig {
     pub fn oauth(&self) -> Option<&OAuthConfig> {
         self.feature_config.oauth.as_ref()
     }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.feature_config.model.as_deref()
+    }
+
+    #[must_use]
+    pub fn permission_mode(&self) -> Option<ResolvedPermissionMode> {
+        self.feature_config.permission_mode
+    }
 }
 
 impl RuntimeFeatureConfig {
@@ -268,6 +300,16 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn oauth(&self) -> Option<&OAuthConfig> {
         self.oauth.as_ref()
+    }
+
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    #[must_use]
+    pub fn permission_mode(&self) -> Option<ResolvedPermissionMode> {
+        self.permission_mode
     }
 }
 
@@ -307,6 +349,7 @@ impl McpServerConfig {
 fn read_optional_json_object(
     path: &Path,
 ) -> Result<Option<BTreeMap<String, JsonValue>>, ConfigError> {
+    let is_legacy_config = path.file_name().and_then(|name| name.to_str()) == Some(".claude.json");
     let contents = match fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -317,14 +360,20 @@ fn read_optional_json_object(
         return Ok(Some(BTreeMap::new()));
     }
 
-    let parsed = JsonValue::parse(&contents)
-        .map_err(|error| ConfigError::Parse(format!("{}: {error}", path.display())))?;
-    let object = parsed.as_object().ok_or_else(|| {
-        ConfigError::Parse(format!(
+    let parsed = match JsonValue::parse(&contents) {
+        Ok(parsed) => parsed,
+        Err(error) if is_legacy_config => return Ok(None),
+        Err(error) => return Err(ConfigError::Parse(format!("{}: {error}", path.display()))),
+    };
+    let Some(object) = parsed.as_object() else {
+        if is_legacy_config {
+            return Ok(None);
+        }
+        return Err(ConfigError::Parse(format!(
             "{}: top-level settings value must be a JSON object",
             path.display()
-        ))
-    })?;
+        )));
+    };
     Ok(Some(object.clone()))
 }
 
@@ -353,6 +402,47 @@ fn merge_mcp_servers(
         );
     }
     Ok(())
+}
+
+fn parse_optional_model(root: &JsonValue) -> Option<String> {
+    root.as_object()
+        .and_then(|object| object.get("model"))
+        .and_then(JsonValue::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn parse_optional_permission_mode(
+    root: &JsonValue,
+) -> Result<Option<ResolvedPermissionMode>, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(None);
+    };
+    if let Some(mode) = object.get("permissionMode").and_then(JsonValue::as_str) {
+        return parse_permission_mode_label(mode, "merged settings.permissionMode").map(Some);
+    }
+    let Some(mode) = object
+        .get("permissions")
+        .and_then(JsonValue::as_object)
+        .and_then(|permissions| permissions.get("defaultMode"))
+        .and_then(JsonValue::as_str)
+    else {
+        return Ok(None);
+    };
+    parse_permission_mode_label(mode, "merged settings.permissions.defaultMode").map(Some)
+}
+
+fn parse_permission_mode_label(
+    mode: &str,
+    context: &str,
+) -> Result<ResolvedPermissionMode, ConfigError> {
+    match mode {
+        "default" | "plan" | "read-only" => Ok(ResolvedPermissionMode::ReadOnly),
+        "acceptEdits" | "auto" | "workspace-write" => Ok(ResolvedPermissionMode::WorkspaceWrite),
+        "dontAsk" | "danger-full-access" => Ok(ResolvedPermissionMode::DangerFullAccess),
+        other => Err(ConfigError::Parse(format!(
+            "{context}: unsupported permission mode {other}"
+        ))),
+    }
 }
 
 fn parse_optional_oauth_config(
@@ -594,7 +684,8 @@ fn deep_merge_objects(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfigLoader, ConfigSource, McpServerConfig, McpTransport, CLAUDE_CODE_SETTINGS_SCHEMA_NAME,
+        ConfigLoader, ConfigSource, McpServerConfig, McpTransport, ResolvedPermissionMode,
+        CLAUDE_CODE_SETTINGS_SCHEMA_NAME,
     };
     use crate::json::JsonValue;
     use std::fs;
@@ -636,13 +727,23 @@ mod tests {
         fs::create_dir_all(&home).expect("home config dir");
 
         fs::write(
+            home.parent().expect("home parent").join(".claude.json"),
+            r#"{"model":"haiku","env":{"A":"1"},"mcpServers":{"home":{"command":"uvx","args":["home"]}}}"#,
+        )
+        .expect("write user compat config");
+        fs::write(
             home.join("settings.json"),
-            r#"{"model":"sonnet","env":{"A":"1"},"hooks":{"PreToolUse":["base"]}}"#,
+            r#"{"model":"sonnet","env":{"A2":"1"},"hooks":{"PreToolUse":["base"]},"permissions":{"defaultMode":"plan"}}"#,
         )
         .expect("write user settings");
         fs::write(
+            cwd.join(".claude.json"),
+            r#"{"model":"project-compat","env":{"B":"2"}}"#,
+        )
+        .expect("write project compat config");
+        fs::write(
             cwd.join(".claude").join("settings.json"),
-            r#"{"env":{"B":"2"},"hooks":{"PostToolUse":["project"]}}"#,
+            r#"{"env":{"C":"3"},"hooks":{"PostToolUse":["project"]},"mcpServers":{"project":{"command":"uvx","args":["project"]}}}"#,
         )
         .expect("write project settings");
         fs::write(
@@ -656,11 +757,16 @@ mod tests {
             .expect("config should load");
 
         assert_eq!(CLAUDE_CODE_SETTINGS_SCHEMA_NAME, "SettingsSchema");
-        assert_eq!(loaded.loaded_entries().len(), 3);
+        assert_eq!(loaded.loaded_entries().len(), 5);
         assert_eq!(loaded.loaded_entries()[0].source, ConfigSource::User);
         assert_eq!(
             loaded.get("model"),
             Some(&JsonValue::String("opus".to_string()))
+        );
+        assert_eq!(loaded.model(), Some("opus"));
+        assert_eq!(
+            loaded.permission_mode(),
+            Some(ResolvedPermissionMode::WorkspaceWrite)
         );
         assert_eq!(
             loaded
@@ -668,13 +774,20 @@ mod tests {
                 .and_then(JsonValue::as_object)
                 .expect("env object")
                 .len(),
-            2
+            4
         );
         assert!(loaded
             .get("hooks")
             .and_then(JsonValue::as_object)
             .expect("hooks object")
             .contains_key("PreToolUse"));
+        assert!(loaded
+            .get("hooks")
+            .and_then(JsonValue::as_object)
+            .expect("hooks object")
+            .contains_key("PostToolUse"));
+        assert!(loaded.mcp().get("home").is_some());
+        assert!(loaded.mcp().get("project").is_some());
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }

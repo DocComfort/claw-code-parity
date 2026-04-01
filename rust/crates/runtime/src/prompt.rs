@@ -201,6 +201,7 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
             dir.join("CLAUDE.md"),
             dir.join("CLAUDE.local.md"),
             dir.join(".claude").join("CLAUDE.md"),
+            dir.join(".claude").join("instructions.md"),
         ] {
             push_context_file(&mut files, candidate)?;
         }
@@ -468,6 +469,10 @@ mod tests {
         std::env::temp_dir().join(format!("runtime-prompt-{nanos}"))
     }
 
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::test_env_lock()
+    }
+
     #[test]
     fn discovers_instruction_files_from_ancestor_chain() {
         let root = temp_dir();
@@ -477,10 +482,21 @@ mod tests {
         fs::write(root.join("CLAUDE.local.md"), "local instructions")
             .expect("write local instructions");
         fs::create_dir_all(root.join("apps")).expect("apps dir");
+        fs::create_dir_all(root.join("apps").join(".claude")).expect("apps claude dir");
         fs::write(root.join("apps").join("CLAUDE.md"), "apps instructions")
             .expect("write apps instructions");
+        fs::write(
+            root.join("apps").join(".claude").join("instructions.md"),
+            "apps dot claude instructions",
+        )
+        .expect("write apps dot claude instructions");
         fs::write(nested.join(".claude").join("CLAUDE.md"), "nested rules")
             .expect("write nested rules");
+        fs::write(
+            nested.join(".claude").join("instructions.md"),
+            "nested instructions",
+        )
+        .expect("write nested instructions");
 
         let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
         let contents = context
@@ -495,7 +511,9 @@ mod tests {
                 "root instructions",
                 "local instructions",
                 "apps instructions",
-                "nested rules"
+                "apps dot claude instructions",
+                "nested rules",
+                "nested instructions"
             ]
         );
         fs::remove_dir_all(root).expect("cleanup temp dir");
@@ -574,7 +592,12 @@ mod tests {
         )
         .expect("write settings");
 
+        let _guard = env_lock();
         let previous = std::env::current_dir().expect("cwd");
+        let original_home = std::env::var("HOME").ok();
+        let original_claude_home = std::env::var("CLAUDE_CONFIG_HOME").ok();
+        std::env::set_var("HOME", &root);
+        std::env::set_var("CLAUDE_CONFIG_HOME", root.join("missing-home"));
         std::env::set_current_dir(&root).expect("change cwd");
         let prompt = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8")
             .expect("system prompt should load")
@@ -584,6 +607,16 @@ mod tests {
 ",
             );
         std::env::set_current_dir(previous).expect("restore cwd");
+        if let Some(value) = original_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = original_claude_home {
+            std::env::set_var("CLAUDE_CONFIG_HOME", value);
+        } else {
+            std::env::remove_var("CLAUDE_CONFIG_HOME");
+        }
 
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
@@ -629,6 +662,29 @@ mod tests {
         let rendered = truncate_instruction_content(&content, 4_000);
         assert!(rendered.contains("[truncated]"));
         assert!(rendered.chars().count() <= 4_000 + "\n\n[truncated]".chars().count());
+    }
+
+    #[test]
+    fn discovers_dot_claude_instructions_markdown() {
+        let root = temp_dir();
+        let nested = root.join("apps").join("api");
+        fs::create_dir_all(nested.join(".claude")).expect("nested claude dir");
+        fs::write(
+            nested.join(".claude").join("instructions.md"),
+            "instruction markdown",
+        )
+        .expect("write instructions.md");
+
+        let context = ProjectContext::discover(&nested, "2026-03-31").expect("context should load");
+        assert!(context
+            .instruction_files
+            .iter()
+            .any(|file| file.path.ends_with(".claude/instructions.md")));
+        assert!(
+            render_instruction_files(&context.instruction_files).contains("instruction markdown")
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
