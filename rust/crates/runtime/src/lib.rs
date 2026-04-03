@@ -17,9 +17,9 @@ pub mod permission_enforcer;
 mod permissions;
 mod prompt;
 mod remote;
-pub mod session_control;
 pub mod sandbox;
 mod session;
+pub mod session_control;
 mod sse;
 pub mod task_registry;
 pub mod team_cron_registry;
@@ -99,6 +99,9 @@ pub use sandbox::{
 pub use session::{
     ContentBlock, ConversationMessage, MessageRole, Session, SessionCompaction, SessionError,
     SessionFork,
+};
+pub use session_control::{
+    SessionControlCommand, SessionControlResponse, SessionController, WorkerHandle,
 };
 pub use sse::{IncrementalSseParser, SseEvent};
 pub use worker_boot::{
