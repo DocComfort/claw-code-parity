@@ -14,7 +14,7 @@ mod mcp_stdio;
 pub mod mcp_tool_bridge;
 mod oauth;
 pub mod permission_enforcer;
-mod policy_engine;
+pub mod policy_engine;
 mod permissions;
 mod prompt;
 mod remote;
