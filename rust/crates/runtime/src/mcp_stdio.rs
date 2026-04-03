@@ -25,6 +25,11 @@ const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 300;
 #[cfg(not(test))]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 30_000;
 
+#[cfg(test)]
+const MCP_LIST_RESOURCES_TIMEOUT_MS: u64 = 300;
+#[cfg(not(test))]
+const MCP_LIST_RESOURCES_TIMEOUT_MS: u64 = 30_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum JsonRpcId {
@@ -223,6 +228,12 @@ pub struct ManagedMcpTool {
     pub tool: McpTool,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ManagedMcpResource {
+    pub server_name: String,
+    pub resource: McpResource,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedMcpServer {
     pub server_name: String,
@@ -418,6 +429,65 @@ impl McpServerManager {
         }
 
         Ok(discovered_tools)
+    }
+
+    pub async fn list_resources(
+        &mut self,
+        server_name: Option<&str>,
+    ) -> Result<Vec<ManagedMcpResource>, McpServerManagerError> {
+        let server_names = match server_name {
+            Some(server_name) => vec![server_name.to_string()],
+            None => self.servers.keys().cloned().collect::<Vec<_>>(),
+        };
+        let mut resources = Vec::new();
+
+        for server_name in server_names {
+            resources.extend(self.list_resources_for_server(&server_name).await?);
+        }
+
+        Ok(resources)
+    }
+
+    pub async fn read_resource(
+        &mut self,
+        server_name: &str,
+        uri: &str,
+    ) -> Result<JsonRpcResponse<McpReadResourceResult>, McpServerManagerError> {
+        let timeout_ms = self.tool_call_timeout_ms(server_name)?;
+
+        self.ensure_server_ready(server_name).await?;
+        let request_id = self.take_request_id();
+        let response =
+            {
+                let server = self.server_mut(server_name)?;
+                let process = server.process.as_mut().ok_or_else(|| {
+                    McpServerManagerError::InvalidResponse {
+                        server_name: server_name.to_string(),
+                        method: "resources/read",
+                        details: "server process missing after initialization".to_string(),
+                    }
+                })?;
+                Self::run_process_request(
+                    server_name,
+                    "resources/read",
+                    timeout_ms,
+                    process.read_resource(
+                        request_id,
+                        McpReadResourceParams {
+                            uri: uri.to_string(),
+                        },
+                    ),
+                )
+                .await
+            };
+
+        if let Err(error) = &response {
+            if Self::should_reset_server(error) {
+                self.reset_server(server_name).await?;
+            }
+        }
+
+        response
     }
 
     pub async fn call_tool(
@@ -621,6 +691,94 @@ impl McpServerManager {
         }
 
         Ok(discovered_tools)
+    }
+
+    async fn list_resources_for_server(
+        &mut self,
+        server_name: &str,
+    ) -> Result<Vec<ManagedMcpResource>, McpServerManagerError> {
+        let mut attempts = 0;
+
+        loop {
+            match self.list_resources_for_server_once(server_name).await {
+                Ok(resources) => return Ok(resources),
+                Err(error) if attempts == 0 && Self::is_retryable_error(&error) => {
+                    self.reset_server(server_name).await?;
+                    attempts += 1;
+                }
+                Err(error) => {
+                    if Self::should_reset_server(&error) {
+                        self.reset_server(server_name).await?;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    async fn list_resources_for_server_once(
+        &mut self,
+        server_name: &str,
+    ) -> Result<Vec<ManagedMcpResource>, McpServerManagerError> {
+        self.ensure_server_ready(server_name).await?;
+
+        let mut discovered_resources = Vec::new();
+        let mut cursor = None;
+        loop {
+            let request_id = self.take_request_id();
+            let response = {
+                let server = self.server_mut(server_name)?;
+                let process = server.process.as_mut().ok_or_else(|| {
+                    McpServerManagerError::InvalidResponse {
+                        server_name: server_name.to_string(),
+                        method: "resources/list",
+                        details: "server process missing after initialization".to_string(),
+                    }
+                })?;
+                Self::run_process_request(
+                    server_name,
+                    "resources/list",
+                    MCP_LIST_RESOURCES_TIMEOUT_MS,
+                    process.list_resources(
+                        request_id,
+                        Some(McpListResourcesParams {
+                            cursor: cursor.clone(),
+                        }),
+                    ),
+                )
+                .await?
+            };
+
+            if let Some(error) = response.error {
+                return Err(McpServerManagerError::JsonRpc {
+                    server_name: server_name.to_string(),
+                    method: "resources/list",
+                    error,
+                });
+            }
+
+            let result = response
+                .result
+                .ok_or_else(|| McpServerManagerError::InvalidResponse {
+                    server_name: server_name.to_string(),
+                    method: "resources/list",
+                    details: "missing result payload".to_string(),
+                })?;
+
+            for resource in result.resources {
+                discovered_resources.push(ManagedMcpResource {
+                    server_name: server_name.to_string(),
+                    resource,
+                });
+            }
+
+            match result.next_cursor {
+                Some(next_cursor) => cursor = Some(next_cursor),
+                None => break,
+            }
+        }
+
+        Ok(discovered_resources)
     }
 
     async fn reset_server(&mut self, server_name: &str) -> Result<(), McpServerManagerError> {
@@ -1386,6 +1544,36 @@ mod tests {
             "                'isError': False",
             "            }",
             "        })",
+            "    elif method == 'resources/list':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'resources': [",
+            "                    {",
+            "                        'uri': f'resource://{LABEL}/guide.txt',",
+            "                        'name': f'{LABEL}-guide',",
+            "                        'description': f'Guide for {LABEL}',",
+            "                        'mimeType': 'text/plain'",
+            "                    }",
+            "                ]",
+            "            }",
+            "        })",
+            "    elif method == 'resources/read':",
+            "        uri = request['params']['uri']",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'contents': [",
+            "                    {",
+            "                        'uri': uri,",
+            "                        'mimeType': 'text/plain',",
+            "                        'text': f'{LABEL} contents for {uri}'",
+            "                    }",
+            "                ]",
+            "            }",
+            "        })",
             "    else:",
             "        send_message({",
             "            'jsonrpc': '2.0',",
@@ -1929,6 +2117,60 @@ mod tests {
                     .and_then(|result| result.structured_content.as_ref())
                     .and_then(|value| value.get("server")),
                 Some(&json!("beta"))
+            );
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn manager_lists_and_reads_resources_from_stdio_servers() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_manager_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("resources.log");
+            let servers = BTreeMap::from([(
+                "alpha".to_string(),
+                manager_server_config(&script_path, "alpha", &log_path),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let resources = manager
+                .list_resources(Some("alpha"))
+                .await
+                .expect("list resources");
+
+            assert_eq!(resources.len(), 1);
+            assert_eq!(resources[0].server_name, "alpha");
+            assert_eq!(resources[0].resource.uri, "resource://alpha/guide.txt");
+            assert_eq!(resources[0].resource.name.as_deref(), Some("alpha-guide"));
+
+            let read = manager
+                .read_resource("alpha", "resource://alpha/guide.txt")
+                .await
+                .expect("read resource");
+
+            assert_eq!(
+                read.result.as_ref().map(|result| result.contents.len()),
+                Some(1)
+            );
+            assert_eq!(
+                read.result
+                    .as_ref()
+                    .and_then(|result| result.contents.first())
+                    .and_then(|content| content.text.as_deref()),
+                Some("alpha contents for resource://alpha/guide.txt")
+            );
+
+            let log = fs::read_to_string(&log_path).expect("read log");
+            assert_eq!(
+                log.lines().collect::<Vec<_>>(),
+                vec!["initialize", "resources/list", "resources/read"]
             );
 
             manager.shutdown().await.expect("shutdown");

@@ -70,6 +70,7 @@ impl TeamRegistry {
     }
 
     /// Create a new team with the given name and task IDs.
+    #[must_use]
     pub fn create(&self, name: &str, task_ids: Vec<String>) -> Team {
         let mut inner = self.inner.lock().expect("team registry lock poisoned");
         inner.counter += 1;
@@ -88,12 +89,14 @@ impl TeamRegistry {
     }
 
     /// Get a team by ID.
+    #[must_use]
     pub fn get(&self, team_id: &str) -> Option<Team> {
         let inner = self.inner.lock().expect("team registry lock poisoned");
         inner.teams.get(team_id).cloned()
     }
 
     /// List all teams.
+    #[must_use]
     pub fn list(&self) -> Vec<Team> {
         let inner = self.inner.lock().expect("team registry lock poisoned");
         inner.teams.values().cloned().collect()
@@ -112,6 +115,7 @@ impl TeamRegistry {
     }
 
     /// Remove a team entirely from the registry.
+    #[must_use]
     pub fn remove(&self, team_id: &str) -> Option<Team> {
         let mut inner = self.inner.lock().expect("team registry lock poisoned");
         inner.teams.remove(team_id)
@@ -166,6 +170,7 @@ impl CronRegistry {
     }
 
     /// Create a new cron entry.
+    #[must_use]
     pub fn create(&self, schedule: &str, prompt: &str, description: Option<&str>) -> CronEntry {
         let mut inner = self.inner.lock().expect("cron registry lock poisoned");
         inner.counter += 1;
@@ -187,12 +192,14 @@ impl CronRegistry {
     }
 
     /// Get a cron entry by ID.
+    #[must_use]
     pub fn get(&self, cron_id: &str) -> Option<CronEntry> {
         let inner = self.inner.lock().expect("cron registry lock poisoned");
         inner.entries.get(cron_id).cloned()
     }
 
     /// List all cron entries, optionally filtered to enabled only.
+    #[must_use]
     pub fn list(&self, enabled_only: bool) -> Vec<CronEntry> {
         let inner = self.inner.lock().expect("cron registry lock poisoned");
         inner
@@ -284,7 +291,7 @@ mod tests {
         assert_eq!(still_there.status, TeamStatus::Deleted);
 
         // Hard remove
-        registry.remove(&t2.team_id);
+        let _ = registry.remove(&t2.team_id);
         assert_eq!(registry.len(), 1);
     }
 

@@ -48,6 +48,10 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 | **Sleep** | `tools` | delay execution — **good parity** |
 | **SendUserMessage/Brief** | `tools` | user-facing message — **good parity** |
 | **Config** | `tools` | config inspection — **moderate parity** |
+| **ListMcpResources** | `tools` + `runtime::mcp_stdio` | stdio MCP connect/list resources/disconnect — **moderate parity**. Missing: remote transports |
+| **ReadMcpResource** | `tools` + `runtime::mcp_stdio` | stdio MCP connect/read resource/disconnect — **moderate parity**. Missing: remote transports |
+| **McpAuth** | `tools` + `runtime::mcp_client` | stdio no-auth connect probe + OAuth requirement reporting — **partial parity**. Missing: interactive OAuth/browser flow |
+| **MCP** | `tools` + `runtime::mcp_stdio` | stdio MCP connect/list tools/call/disconnect — **moderate parity**. Missing: remote transports |
 | **EnterPlanMode** | `tools` | worktree plan mode toggle — **good parity** |
 | **ExitPlanMode** | `tools` | worktree plan mode restore — **good parity** |
 | **StructuredOutput** | `tools` | passthrough JSON — **good parity** |
@@ -71,10 +75,6 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 | **CronDelete** | stub | needs cron registry |
 | **CronList** | stub | needs cron registry |
 | **LSP** | stub | needs language server client |
-| **ListMcpResources** | stub | needs MCP client |
-| **ReadMcpResource** | stub | needs MCP client |
-| **McpAuth** | stub | needs OAuth flow |
-| **MCP** | stub | needs MCP tool proxy |
 | **RemoteTrigger** | stub | needs HTTP client |
 | **TestingPermission** | stub | test-only, low priority |
 
@@ -108,7 +108,9 @@ Harness note: milestone 2 validates bash success plus workspace-write escalation
 Harness note: read_file, grep_search, write_file allow/deny, and multi-tool same-turn assembly are now covered by the mock parity harness.
 
 **Config/Plugin/MCP flows:**
-- [ ] Full MCP server lifecycle (connect, list tools, call tool, disconnect)
+- [x] Stdio MCP lifecycle (connect, list tools/resources, call tool, read resource, disconnect)
+- [ ] Remote MCP transports (HTTP/SSE/WS/managed proxy)
+- [ ] Interactive MCP OAuth/browser auth flow
 - [ ] Plugin install/enable/disable/uninstall full flow
 - [ ] Config merge precedence (user > project > local)
 

@@ -14,9 +14,11 @@ use runtime::{
     edit_file, execute_bash, glob_search, grep_search, load_system_prompt, read_file,
     task_registry::TaskRegistry,
     team_cron_registry::{CronRegistry, TeamRegistry},
-    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock,
-    ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, RuntimeError, Session, ToolError, ToolExecutor,
+    write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ConfigLoader,
+    ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput, McpClientAuth,
+    McpClientTransport, McpServerManager, McpTransport, MessageRole, PermissionMode,
+    PermissionPolicy, PromptCacheEvent, RuntimeConfig, RuntimeError, Session, ToolError,
+    ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1116,31 +1118,254 @@ fn run_lsp(input: LspInput) -> Result<String, String> {
     }))
 }
 
+fn load_runtime_config_for_current_dir() -> Result<RuntimeConfig, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    ConfigLoader::default_for(cwd)
+        .load()
+        .map_err(|error| error.to_string())
+}
+
+fn prepare_mcp_manager(
+) -> Result<(tokio::runtime::Runtime, RuntimeConfig, McpServerManager), String> {
+    let config = load_runtime_config_for_current_dir()?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+    let manager = McpServerManager::from_runtime_config(&config);
+    Ok((runtime, config, manager))
+}
+
+fn finish_mcp_manager_operation<T, E: ToString>(
+    runtime: &tokio::runtime::Runtime,
+    manager: &mut McpServerManager,
+    result: Result<T, E>,
+) -> Result<T, String> {
+    let result = result.map_err(|error| error.to_string());
+    let shutdown_result = runtime
+        .block_on(manager.shutdown())
+        .map_err(|error| error.to_string());
+    match (result, shutdown_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn require_configured_mcp_server<'a>(
+    config: &'a RuntimeConfig,
+    server_name: &str,
+) -> Result<&'a runtime::ScopedMcpServerConfig, String> {
+    config
+        .mcp()
+        .get(server_name)
+        .ok_or_else(|| format!("unknown MCP server `{server_name}`"))
+}
+
+fn mcp_transport_label(transport: McpTransport) -> &'static str {
+    match transport {
+        McpTransport::Stdio => "stdio",
+        McpTransport::Sse => "sse",
+        McpTransport::Http => "http",
+        McpTransport::Ws => "ws",
+        McpTransport::Sdk => "sdk",
+        McpTransport::ManagedProxy => "managed_proxy",
+    }
+}
+
+fn mcp_auth_from_transport(transport: &McpClientTransport) -> McpClientAuth {
+    match transport {
+        McpClientTransport::Sse(remote) | McpClientTransport::Http(remote) => remote.auth.clone(),
+        McpClientTransport::Stdio(_)
+        | McpClientTransport::WebSocket(_)
+        | McpClientTransport::Sdk(_)
+        | McpClientTransport::ManagedProxy(_) => McpClientAuth::None,
+    }
+}
+
+fn render_unsupported_mcp_servers(
+    manager: &McpServerManager,
+    server_filter: Option<&str>,
+) -> Vec<Value> {
+    manager
+        .unsupported_servers()
+        .iter()
+        .filter(|server| server_filter.is_none_or(|filter| filter == server.server_name))
+        .map(|server| {
+            json!({
+                "server": server.server_name,
+                "transport": mcp_transport_label(server.transport),
+                "reason": server.reason,
+            })
+        })
+        .collect()
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn run_list_mcp_resources(input: McpResourceInput) -> Result<String, String> {
+    let (runtime, config, mut manager) = prepare_mcp_manager()?;
+    if let Some(server_name) = input.server.as_deref() {
+        let scoped = require_configured_mcp_server(&config, server_name)?;
+        if scoped.transport() != McpTransport::Stdio {
+            let unsupported_servers = render_unsupported_mcp_servers(&manager, Some(server_name));
+            return to_pretty_json(json!({
+                "server": input.server,
+                "resources": [],
+                "count": 0,
+                "unsupportedServers": unsupported_servers,
+                "message": format!(
+                    "MCP server `{server_name}` uses unsupported transport `{}` for resource listing",
+                    mcp_transport_label(scoped.transport())
+                ),
+            }));
+        }
+    }
+
+    let unsupported_servers = render_unsupported_mcp_servers(&manager, input.server.as_deref());
+    let operation_result = runtime.block_on(manager.list_resources(input.server.as_deref()));
+    let resources = finish_mcp_manager_operation(&runtime, &mut manager, operation_result)?;
+    let resource_count = resources.len();
+    let resources_empty = resources.is_empty();
+    let rendered_resources = resources
+        .into_iter()
+        .map(|resource| {
+            json!({
+                "server": resource.server_name,
+                "uri": resource.resource.uri,
+                "name": resource.resource.name,
+                "description": resource.resource.description,
+                "mimeType": resource.resource.mime_type,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let message = if resources_empty {
+        Some(if config.mcp().servers().is_empty() {
+            "No MCP servers configured".to_string()
+        } else {
+            "No MCP resources available".to_string()
+        })
+    } else {
+        None
+    };
+
     to_pretty_json(json!({
         "server": input.server,
-        "resources": [],
-        "message": "No MCP resources available"
+        "resources": rendered_resources,
+        "count": resource_count,
+        "unsupportedServers": unsupported_servers,
+        "message": message,
     }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_read_mcp_resource(input: McpResourceInput) -> Result<String, String> {
+    let uri = input
+        .uri
+        .clone()
+        .ok_or_else(|| "missing field `uri`".to_string())?;
+    let (runtime, config, mut manager) = prepare_mcp_manager()?;
+    let operation_result = (|| {
+        let server_name = if let Some(server_name) = input.server.as_deref() {
+            let scoped = require_configured_mcp_server(&config, server_name)?;
+            if scoped.transport() != McpTransport::Stdio {
+                return Err(format!(
+                    "MCP server `{server_name}` uses unsupported transport `{}` for resource reads",
+                    mcp_transport_label(scoped.transport())
+                ));
+            }
+            server_name.to_string()
+        } else {
+            let resources = runtime
+                .block_on(manager.list_resources(None))
+                .map_err(|error| error.to_string())?;
+            let matching_servers = resources
+                .into_iter()
+                .filter(|resource| resource.resource.uri == uri)
+                .map(|resource| resource.server_name)
+                .collect::<BTreeSet<_>>();
+            match matching_servers.len() {
+                0 => return Err(format!("MCP resource `{uri}` was not found")),
+                1 => matching_servers
+                    .into_iter()
+                    .next()
+                    .expect("single resource server should exist"),
+                _ => {
+                    return Err(format!(
+                        "MCP resource `{uri}` is exposed by multiple servers; specify `server`"
+                    ));
+                }
+            }
+        };
+
+        let response = runtime
+            .block_on(manager.read_resource(&server_name, &uri))
+            .map_err(|error| error.to_string())?;
+        Ok((server_name, response))
+    })();
+    let (server_name, response) =
+        finish_mcp_manager_operation(&runtime, &mut manager, operation_result)?;
+
     to_pretty_json(json!({
-        "server": input.server,
-        "uri": input.uri,
-        "content": "",
-        "message": "Resource not available"
+        "server": server_name,
+        "uri": uri,
+        "contents": response.result.as_ref().map(|result| result.contents.clone()).unwrap_or_default(),
+        "content": response
+            .result
+            .as_ref()
+            .and_then(|result| result.contents.first())
+            .and_then(|content| content.text.clone().or_else(|| content.blob.clone()))
+            .unwrap_or_default(),
+        "error": response.error,
     }))
 }
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_mcp_auth(input: McpAuthInput) -> Result<String, String> {
+    let (runtime, config, mut manager) = prepare_mcp_manager()?;
+    let scoped = require_configured_mcp_server(&config, &input.server)?;
+    let transport = scoped.transport();
+    let client_transport = McpClientTransport::from_config(&scoped.config);
+    let auth = mcp_auth_from_transport(&client_transport);
+    let auth_required = auth.requires_user_auth();
+
+    if transport == McpTransport::Stdio && !auth_required {
+        let operation_result = runtime.block_on(manager.list_resources(Some(&input.server)));
+        let resources = finish_mcp_manager_operation(&runtime, &mut manager, operation_result)?;
+        return to_pretty_json(json!({
+            "server": input.server,
+            "transport": mcp_transport_label(transport),
+            "status": "connected",
+            "authRequired": false,
+            "resourceCount": resources.len(),
+            "message": "MCP server connected without user authentication",
+        }));
+    }
+
+    let oauth = match auth {
+        McpClientAuth::OAuth(oauth) => Some(json!({
+            "clientId": oauth.client_id,
+            "callbackPort": oauth.callback_port,
+            "authServerMetadataUrl": oauth.auth_server_metadata_url,
+            "xaa": oauth.xaa,
+        })),
+        McpClientAuth::None => None,
+    };
+
     to_pretty_json(json!({
         "server": input.server,
-        "status": "auth_required",
-        "message": "MCP authentication not yet implemented"
+        "transport": mcp_transport_label(transport),
+        "status": if auth_required { "auth_required" } else { "unsupported_transport" },
+        "authRequired": auth_required,
+        "oauth": oauth,
+        "message": if auth_required {
+            format!(
+                "MCP server `{}` requires user authentication for `{}` transport",
+                input.server,
+                mcp_transport_label(transport)
+            )
+        } else {
+            format!(
+                "MCP transport `{}` is not yet connected by the runtime auth flow",
+                mcp_transport_label(transport)
+            )
+        },
     }))
 }
 
@@ -1158,12 +1383,35 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
 
 #[allow(clippy::needless_pass_by_value)]
 fn run_mcp_tool(input: McpToolInput) -> Result<String, String> {
+    let (runtime, config, mut manager) = prepare_mcp_manager()?;
+    let scoped = require_configured_mcp_server(&config, &input.server)?;
+    if scoped.transport() != McpTransport::Stdio {
+        return Err(format!(
+            "MCP server `{}` uses unsupported transport `{}` for tool execution",
+            input.server,
+            mcp_transport_label(scoped.transport())
+        ));
+    }
+
+    let qualified_tool_name = runtime::mcp_tool_name(&input.server, &input.tool);
+    let operation_result = (|| {
+        runtime
+            .block_on(manager.discover_tools())
+            .map_err(|error| error.to_string())?;
+        runtime
+            .block_on(manager.call_tool(&qualified_tool_name, input.arguments.clone()))
+            .map_err(|error| error.to_string())
+    })();
+    let response = finish_mcp_manager_operation(&runtime, &mut manager, operation_result)?;
+
     to_pretty_json(json!({
         "server": input.server,
         "tool": input.tool,
+        "qualifiedToolName": qualified_tool_name,
         "arguments": input.arguments,
-        "result": null,
-        "message": "MCP tool proxy not yet connected"
+        "result": response.result,
+        "error": response.error,
+        "message": response.error.as_ref().map(|error| error.message.clone()),
     }))
 }
 
@@ -4095,6 +4343,7 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
@@ -4121,6 +4370,132 @@ mod tests {
             .expect("time")
             .as_nanos();
         std::env::temp_dir().join(format!("clawd-tools-{unique}-{name}"))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn write_fake_mcp_server_script(script_path: &std::path::Path, log_path: &std::path::Path) {
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, os, sys",
+            "",
+            "LOG_PATH = os.environ.get('MCP_LOG_PATH')",
+            "",
+            "def log(method):",
+            "    if LOG_PATH:",
+            "        with open(LOG_PATH, 'a', encoding='utf-8') as handle:",
+            "            handle.write(f'{method}\\n')",
+            "",
+            "def read_message():",
+            "    header = b''",
+            r"    while not header.endswith(b'\r\n\r\n'):",
+            "        chunk = sys.stdin.buffer.read(1)",
+            "        if not chunk:",
+            "            return None",
+            "        header += chunk",
+            "    length = 0",
+            r"    for line in header.decode().split('\r\n'):",
+            r"        if line.lower().startswith('content-length:'):",
+            r"            length = int(line.split(':', 1)[1].strip())",
+            "    payload = sys.stdin.buffer.read(length)",
+            "    return json.loads(payload.decode())",
+            "",
+            "def send_message(message):",
+            "    payload = json.dumps(message).encode()",
+            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            "    sys.stdout.buffer.flush()",
+            "",
+            "while True:",
+            "    request = read_message()",
+            "    if request is None:",
+            "        break",
+            "    method = request['method']",
+            "    log(method)",
+            "    if method == 'initialize':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'protocolVersion': request['params']['protocolVersion'],",
+            "                'capabilities': {'tools': {}, 'resources': {}},",
+            "                'serverInfo': {'name': 'fake-mcp', 'version': '1.0.0'}",
+            "            }",
+            "        })",
+            "    elif method == 'tools/list':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'tools': [",
+            "                    {",
+            "                        'name': 'echo',",
+            "                        'description': 'Echo tool',",
+            "                        'inputSchema': {",
+            "                            'type': 'object',",
+            "                            'properties': {'text': {'type': 'string'}},",
+            "                            'required': ['text']",
+            "                        }",
+            "                    }",
+            "                ]",
+            "            }",
+            "        })",
+            "    elif method == 'tools/call':",
+            "        args = request['params'].get('arguments') or {}",
+            "        text = args.get('text', '')",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'content': [{'type': 'text', 'text': f'echo:{text}'}],",
+            "                'structuredContent': {'echoed': text},",
+            "                'isError': False",
+            "            }",
+            "        })",
+            "    elif method == 'resources/list':",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'resources': [",
+            "                    {",
+            "                        'uri': 'resource://alpha/guide.txt',",
+            "                        'name': 'alpha-guide',",
+            "                        'description': 'Guide text',",
+            "                        'mimeType': 'text/plain'",
+            "                    }",
+            "                ]",
+            "            }",
+            "        })",
+            "    elif method == 'resources/read':",
+            "        uri = request['params']['uri']",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'result': {",
+            "                'contents': [",
+            "                    {",
+            "                        'uri': uri,",
+            "                        'mimeType': 'text/plain',",
+            "                        'text': f'contents for {uri}'",
+            "                    }",
+            "                ]",
+            "            }",
+            "        })",
+            "    else:",
+            "        send_message({",
+            "            'jsonrpc': '2.0',",
+            "            'id': request['id'],",
+            "            'error': {'code': -32601, 'message': f'unknown method: {method}'},",
+            "        })",
+        ]
+        .join("\n");
+
+        fs::write(script_path, script).expect("write fake mcp server");
+        let mut permissions = fs::metadata(script_path)
+            .expect("script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(script_path, permissions).expect("chmod");
+        let _ = fs::remove_file(log_path);
     }
 
     #[test]
@@ -5336,6 +5711,116 @@ mod tests {
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mcp_tools_use_real_stdio_lifecycle() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("mcp-tool-lifecycle");
+        let home = root.join("home");
+        let cwd = root.join("cwd");
+        let script_dir = root.join("scripts");
+        let script_path = script_dir.join("fake-mcp.py");
+        let log_path = root.join("mcp.log");
+
+        fs::create_dir_all(home.join(".claw")).expect("home dir");
+        fs::create_dir_all(cwd.join(".claw")).expect("cwd dir");
+        fs::create_dir_all(&script_dir).expect("script dir");
+        write_fake_mcp_server_script(&script_path, &log_path);
+        fs::write(
+            home.join(".claw").join("settings.json"),
+            serde_json::to_string(&json!({
+                "mcpServers": {
+                    "alpha": {
+                        "command": "python3",
+                        "args": [script_path.to_string_lossy().to_string()],
+                        "env": {
+                            "MCP_LOG_PATH": log_path.to_string_lossy().to_string(),
+                        }
+                    }
+                }
+            }))
+            .expect("serialize settings"),
+        )
+        .expect("write settings");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::set_current_dir(&cwd).expect("set cwd");
+
+        let auth = execute_tool("McpAuth", &json!({"server": "alpha"})).expect("mcp auth");
+        let auth_output: serde_json::Value = serde_json::from_str(&auth).expect("json");
+        assert_eq!(auth_output["status"], "connected");
+        assert_eq!(auth_output["transport"], "stdio");
+        assert_eq!(auth_output["authRequired"], false);
+
+        let listed = execute_tool("ListMcpResources", &json!({"server": "alpha"}))
+            .expect("list mcp resources");
+        let listed_output: serde_json::Value = serde_json::from_str(&listed).expect("json");
+        assert_eq!(listed_output["count"], 1);
+        assert_eq!(listed_output["resources"][0]["server"], "alpha");
+        assert_eq!(
+            listed_output["resources"][0]["uri"],
+            "resource://alpha/guide.txt"
+        );
+
+        let read = execute_tool(
+            "ReadMcpResource",
+            &json!({"server": "alpha", "uri": "resource://alpha/guide.txt"}),
+        )
+        .expect("read mcp resource");
+        let read_output: serde_json::Value = serde_json::from_str(&read).expect("json");
+        assert_eq!(read_output["server"], "alpha");
+        assert_eq!(
+            read_output["content"],
+            "contents for resource://alpha/guide.txt"
+        );
+        assert_eq!(read_output["contents"][0]["mimeType"], "text/plain");
+
+        let called = execute_tool(
+            "MCP",
+            &json!({"server": "alpha", "tool": "echo", "arguments": {"text": "hello"}}),
+        )
+        .expect("call mcp tool");
+        let called_output: serde_json::Value = serde_json::from_str(&called).expect("json");
+        assert_eq!(called_output["qualifiedToolName"], "mcp__alpha__echo");
+        assert_eq!(
+            called_output["result"]["structuredContent"]["echoed"],
+            "hello"
+        );
+        assert_eq!(called_output["result"]["content"][0]["text"], "echo:hello");
+
+        let log = fs::read_to_string(&log_path).expect("read mcp log");
+        assert_eq!(
+            log.lines().collect::<Vec<_>>(),
+            vec![
+                "initialize",
+                "resources/list",
+                "initialize",
+                "resources/list",
+                "initialize",
+                "resources/read",
+                "initialize",
+                "tools/list",
+                "tools/call",
+            ]
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
