@@ -28,11 +28,16 @@ export function useAuth() {
   }
 
   const signUp = async (email: string, password: string, displayName: string) => {
-    const { error } = await supabase.auth.signUp({
+    const { data, error } = await supabase.auth.signUp({
       email,
       password,
       options: { data: { display_name: displayName } },
     })
+    if (!error && data.user) {
+      await supabase
+        .from('profiles')
+        .upsert({ id: data.user.id, display_name: displayName }, { onConflict: 'id' })
+    }
     return error
   }
 
