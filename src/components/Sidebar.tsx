@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { Conversation } from '../types'
-import { PenSquare, Trash2, MessageSquare, LogOut, ChevronLeft, ChevronRight } from 'lucide-react'
+import { SquarePen as PenSquare, Trash2, MessageSquare, LogOut, ChevronLeft, ChevronRight } from 'lucide-react'
 
 interface SidebarProps {
   conversations: Conversation[]
