@@ -268,19 +268,49 @@ Acceptance:
 
 ## Immediate Backlog (from current real pain)
 
-1. Worker readiness handshake + trust resolution
-2. Prompt misdelivery detection and recovery
-3. Canonical lane event schema in clawhip
-4. Failure taxonomy + blocker normalization
-5. Stale-branch detection before workspace tests
-6. MCP structured degraded-startup reporting
-7. Structured task packet format
-8. Lane board / machine-readable status API
-9. Isolate `render_diff_report` tests into tmpdir — currently flaky under `cargo test --workspace` because they read real working-tree git state instead of an isolated repo; breaks CI whenever active worktree ops leave staged/unstaged changes
-10. Swarm branch-lock protocol — when multiple claws target the same branch, add a lock or commit-detection signal so the second claw can skip redundant work instead of running the full explore-plan-implement-test-review cycle on already-committed code
-11. Wire lane-completion emitter — `LaneContext::completed` is a passive bool set by callers; nothing fires it automatically; need a runtime path that sets `completed = true` and triggers the policy engine lane-closeout rule when a branch is pushed, tests pass, and session control reports done
-12. Wire `SummaryCompressor` into the lane event pipeline — `summary_compression.rs` is exported but called nowhere; `LaneEvent` stream is never fed through the compressor; orchestrating claws receive raw events instead of compressed actionable summaries
-13. Add cross-module integration tests — every Phase 1-2 module has unit tests but no integration test connects adjacent modules (e.g. `WorkerFailure` from `worker_boot` into `RecoveryRecipe`, `LaneEvent` through `SummaryCompressor`, `GreenContract::can_merge` after `StaleCheck`); without these, wiring gaps are invisible to CI
+Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 = clawability hardening, P3 = swarm-efficiency improvements.
+
+**P0 — Fix first (CI reliability)**
+1. Isolate `render_diff_report` tests into tmpdir — flaky under `cargo test --workspace`; reads real working-tree state; breaks CI during active worktree ops
+2. Expand GitHub CI from single-crate coverage to workspace-grade verification — current `rust-ci.yml` runs `cargo fmt` and `cargo test -p rusty-claude-cli`, but misses broader `cargo test --workspace` coverage that already passes locally
+3. Add release-grade binary workflow — repo has a Rust CLI and release intent, but no GitHub Actions path that builds tagged artifacts / checks release packaging before a publish step
+4. Add container-first test/run docs — runtime detects Docker/Podman/container state, but docs do not show a canonical container workflow for `cargo test --workspace`, binary execution, or bind-mounted repo usage
+5. Surface `doctor` / preflight diagnostics in onboarding docs and help — the CLI already has setup-diagnosis commands and branch preflight machinery, but they are not prominent enough in README/USAGE, so new users still ask manual setup questions instead of running a built-in health check first
+6. Add branding/source-of-truth residue checks for docs — after repo migration, old org names can survive in badges, star-history URLs, and copied snippets; docs need a consistency pass or CI lint to catch stale branding automatically
+7. Reconcile README product narrative with current repo reality — top-level docs now say the active workspace is Rust, but later sections still describe the repo as Python-first; users should not have to infer which implementation is canonical
+8. Eliminate warning spam from first-run help/build path — `cargo run -p rusty-claude-cli -- --help` currently prints a wall of compile warnings before the actual help text, which pollutes the first-touch UX and hides the product surface behind unrelated noise
+9. Promote `doctor` from slash-only to top-level CLI entrypoint — users naturally try `claw doctor`, but today it errors and tells them to enter a REPL or resume path first; healthcheck flows should be callable directly from the shell
+10. Make machine-readable status commands actually machine-readable — `status` and `sandbox` accept the global `--output-format json` flag path, but currently still render prose tables, which breaks shell automation and agent-friendly health polling
+11. Unify legacy config/skill namespaces in user-facing output — `skills` currently surfaces mixed project roots like `.codex` and `.claude`, which leaks historical layers into the current product and makes it unclear which config namespace is canonical
+12. Honor JSON output on inventory commands like `skills` and `mcp` — these are exactly the commands agents and shell scripts want to inspect programmatically, but `--output-format json` still yields prose, forcing text scraping where structured inventory should exist
+13. Audit `--output-format` contract across the whole CLI surface — current behavior is inconsistent by subcommand, so agents cannot trust the global flag without command-by-command probing; the format contract itself needs to become deterministic
+
+**P1 — Next (integration wiring, unblocks verification)**
+2. Add cross-module integration tests — **done**: 12 integration tests covering worker→recovery→policy, stale_branch→policy, green_contract→policy, reconciliation flows
+3. Wire lane-completion emitter — **done**: `lane_completion` module with `detect_lane_completion()` auto-sets `LaneContext::completed` from session-finished + tests-green + push-complete → policy closeout
+4. Wire `SummaryCompressor` into the lane event pipeline — **done**: `compress_summary_text()` feeds into `LaneEvent::Finished` detail field in `tools/src/lib.rs`
+
+**P2 — Clawability hardening (original backlog)**
+5. Worker readiness handshake + trust resolution — **done**: `WorkerStatus` state machine with `Spawning` → `TrustRequired` → `ReadyForPrompt` → `PromptAccepted` → `Running` lifecycle, `trust_auto_resolve` + `trust_gate_cleared` gating
+6. Prompt misdelivery detection and recovery — **done**: `prompt_delivery_attempts` counter, `PromptMisdelivery` event detection, `auto_recover_prompt_misdelivery` + `replay_prompt` recovery arm
+7. Canonical lane event schema in clawhip — **done**: `LaneEvent` enum with `Started/Blocked/Failed/Finished` variants, `LaneEvent::new()` typed constructor, `tools/src/lib.rs` integration
+8. Failure taxonomy + blocker normalization — **done**: `WorkerFailureKind` enum (`TrustGate/PromptDelivery/Protocol/Provider`), `FailureScenario::from_worker_failure_kind()` bridge to recovery recipes
+9. Stale-branch detection before workspace tests — **done**: `stale_branch.rs` module with freshness detection, behind/ahead metrics, policy integration
+10. MCP structured degraded-startup reporting — **done**: `McpManager` degraded-startup reporting (+183 lines in `mcp_stdio.rs`), failed server classification (startup/handshake/config/partial), structured `failed_servers` + `recovery_recommendations` in tool output
+11. Structured task packet format — **done**: `task_packet.rs` module with `TaskPacket` struct, validation, serialization, `TaskScope` resolution (workspace/module/single-file/custom), integrated into `tools/src/lib.rs`
+12. Lane board / machine-readable status API — **done**: Lane completion hardening + `LaneContext::completed` auto-detection + MCP degraded reporting surface machine-readable state
+13. **Session completion failure classification** — **done**: `WorkerFailureKind::Provider` + `observe_completion()` + recovery recipe bridge landed
+14. **Config merge validation gap** — **done**: `config.rs` hook validation before deep-merge (+56 lines), malformed entries fail with source-path context instead of merged parse errors
+15. **MCP manager discovery flaky test** — `manager_discovery_report_keeps_healthy_servers_when_one_server_fails` has intermittent timing issues in CI; temporarily ignored, needs root cause fix
+
+16. **Commit provenance / worktree-aware push events** — clawhip build stream shows duplicate-looking commit messages and worktree-originated pushes without clear supersession indicators; add worktree/branch metadata to push events and de-dup superseded commits in build stream display
+17. **Orphaned module integration audit** — `session_control` is `pub mod` exported from `runtime` but has zero consumers across the entire workspace (no import, no call site outside its own file). `trust_resolver` types are re-exported from `lib.rs` but never instantiated outside unit tests. These modules implement core clawability contracts (session management, trust resolution) that are structurally dead — built but not wired into the CLI or tools crate. **Action:** audit all `pub mod` / `pub use` exports from `runtime` for actual call sites; either wire orphaned modules into the real execution path or demote to `pub(crate)` / `cfg(test)` to prevent false clawability surface.
+18. **Context-window preflight gap** — claw-code auto-compacts only after cumulative input crosses a static `100_000`-token threshold, while provider requests derive `max_tokens` from a naive model-name heuristic (`opus` => 32k, else 64k) and do not appear to preflight `estimated_prompt_tokens + requested_output_tokens` against the selected model’s actual context window. Result: giant sessions can be sent upstream and fail hard with provider-side `input_exceeds_context_by_*` errors instead of local preflight compaction/rejection. **Action:** add a model-context registry + request-size preflight before provider call; if projected request exceeds context, emit a structured `context_window_blocked` event and auto-compact or force `/compact` before retry.
+19. **Subcommand help falls through into runtime/API path** — direct dogfood shows `./target/debug/claw doctor --help` and `./target/debug/claw status --help` do not render local subcommand help. Instead they enter the request path, show `🦀 Thinking...`, then fail with `api returned 500 ... auth_unavailable: no auth available`. Help/usage surfaces must be pure local parsing and never require auth or provider reachability. **Action:** fix argv dispatch so `<subcommand> --help` is intercepted before runtime startup/API client initialization; add regression tests for `doctor --help`, `status --help`, and similar local-info commands.
+
+**P3 — Swarm efficiency**
+13. Swarm branch-lock protocol — detect same-module/same-branch collision before parallel workers drift into duplicate implementation
+14. Commit provenance / worktree-aware push events — emit branch, worktree, superseded-by, and canonical commit lineage so parallel sessions stop producing duplicate-looking push summaries
 
 ## Suggested Session Split
 
